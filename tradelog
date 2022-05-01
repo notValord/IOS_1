@@ -1,0 +1,275 @@
+#!/bin/sh
+
+export POSIXLY_CORRECT=yes
+export LC_NUMERIC=en_US.UTF-8
+export LC_ALL=C
+
+#napoveda
+print_help(){
+  echo "NAME: tradelog - stock market log analyzer"
+  echo "USAGE: tradelog [-h | --help]"
+  echo "       tradelog [FILTER...] [COMMAND] [LOG...]"
+  echo ""
+  echo "COMMAND: "
+  echo "   list-tick   -   print a list of stock symbols, so-called \"Tickers\""
+  echo "   profit      -   print a total profit from closed positions"
+  echo "   pos         -   print a list of values of currently held positions sorted in descending order by value"
+  echo "   last-price  -   print the last known price for every ticker"
+  echo "   hist-ord    -   print  a histogram of the number of transactions according to the ticker"
+  echo "   graph-pos   -   print a graph of values of held positions according to the ticker"
+  echo ""
+  echo "FILTERS:"
+  echo "   -a DATETIME -   after: only logs after this date are processed (excluding this date). DATETIME format is YYYY-MM-DD HH:MM:SS"
+  echo "   -b DATETIME -   before: only logs before this date are processed (excluding this date)"
+  echo "   -t TICKER   -   only entries corresponding to a given ticker are considered.
+                           With multiple occurrences of the switch, the set of all listed ticker is taken"
+  echo "   -w WIDTH    -   for the graph printing set its width, that means adjust the length of the longest line to WIDTH.
+                           WIDTH has to be a positive integer. Multiple occurrences of the switch is an invalid execution"
+  echo "   -h | --help -   print this help"
+  echo ""
+}
+
+#Error vystup
+err(){
+    echo "E: $*" >>/dev/stderr
+    exit 1
+}
+#V pripade pracovanie s prazdnym logom je vystup rovno prazdny a ukoncuje sa
+empty_log(){
+  EMPTY=$(eval "$*")
+      if [ -z "$EMPTY" ]; then
+          exit 0
+      fi
+}
+
+#premenne pre vstup
+COMMAND=""
+LOG_FILES=""
+GZ_LOG_FILES=""
+B_TIME="9999-99-99"
+A_TIME=""
+TICKERS=""
+WIDTH="0"
+READ_INPUT=""
+TIME_FORMAT="[0-9][0-9][0-9][0-9]-[0-1][0-9]-[0-3][0-9] [0-2][0-9]:[0-6][0-9]:[0-6][0-9]"
+
+#zpracovat argumenty
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+  list-tick | pos | profit | last-price | hist-ord | graph-pos)
+    if [ -n "$COMMAND" ]; then
+        err "There can be used only one COMMAND at a time"
+    fi
+    COMMAND="$1"
+    shift
+    ;;
+  -h)
+    print_help
+    exit 0
+    ;;
+  -w)
+    if [ "$2" -le 0 ] || [ $WIDTH != "0" ]; then
+        err "WIDTH has to be a positive integer without multiple occurrences"
+    elif [ -z "$2" ]; then
+      err "Missing argument"
+    fi
+    WIDTH="$2"
+    shift
+    shift #zpracovali sa 2 parametry subezne
+    ;;
+  -t)
+    CHECK=$( echo "$2" | grep ".*;.*" ) #nemoze obsahovat ';'
+    CHECK_2=$( echo "$2" | grep ".*[[:space:]].*" ) #nemoze obsahovat ' '
+    if [ -n "$CHECK" ] || [ -n "$CHECK_2" ]; then
+        err "Invalid ticker, cannot use ';' or ' '"
+    elif [ -z "$2" ]; then
+      err "Missing argument"
+    fi
+
+    if [ -z "$TICKERS" ]; then
+      TICKERS="$2"
+    else
+      TICKERS="$2\|$TICKERS"
+      #pipujeme tickery, '\' kvoli pouziti v uvozovkach eval\awk
+    fi
+    shift
+    shift
+    ;;
+  -b)
+    CHECK=$( echo "$2" | grep "$TIME_FORMAT")
+    if [ -z "$CHECK" ]; then
+        err "Invalid format of time, use YYYY-MM-DD HH:MM:SS"
+    elif [ -z "$2" ]; then
+      err "Missing argument"
+    fi
+
+    B_TIME="$2"
+    shift
+    shift
+    ;;
+  -a)
+    CHECK=$( echo "$2" | grep "$TIME_FORMAT")
+    if [ -z "$CHECK" ]; then
+        err "Invalid format of time, use YYYY-MM-DD HH:MM:SS"
+    elif [ -z "$2" ]; then
+      err "Missing argument"
+    fi
+
+    A_TIME="$2"
+    shift
+    shift
+    ;;
+  *.gz)
+    if ! [ -r "$1" ]; then
+        err "Cannot read from file"
+    fi
+    GZ_LOG_FILES="$GZ_LOG_FILES $1"
+    shift
+    ;;
+  *)
+    if ! [ -r "$1" ]; then
+        err "Cannot read from file"
+    fi
+    LOG_FILES="$LOG_FILES $1"
+    shift
+    ;;
+  esac
+done
+
+#nacitanie logov
+if [ -n "$GZ_LOG_FILES" ] && [ -n "$LOG_FILES" ]; then
+    READ_INPUT="gzip -d -c $GZ_LOG_FILES | cat $LOG_FILES -"
+    #logy a zipy
+elif [ -n "$GZ_LOG_FILES" ]; then
+    READ_INPUT="gzip -d -c $GZ_LOG_FILES"
+    #zipy
+elif [ -n "$LOG_FILES" ]; then
+    READ_INPUT="cat $LOG_FILES"
+    #logy
+else
+    READ_INPUT="cat"
+    #stdin
+fi
+
+if [ -z "$TICKERS" ]; then
+    TICK_FILTER="cat"
+    #bez tikerov
+else
+    TICK_FILTER="grep '^.*;\($TICKERS\);'"
+fi
+
+#filtrace(bud pomocou casu alebo tickerov, medzerou oddelene premenne)
+READ_FILTERED="$READ_INPUT | awk -F ';' '{ if ( \$1 > \"$A_TIME\" ) {print \$0} }'"
+READ_FILTERED="$READ_FILTERED | awk -F ';' '{ if ( \$1 < \"$B_TIME\" ) {print \$0} }'"
+READ_FILTERED="$READ_FILTERED | $TICK_FILTER"
+
+#vypisanie dlzky retazca v druhom stlpci a zoradenie podla danej dlzky
+LENGTH="awk -F ' ' '{ printf \"%s %d\n\", \$0, length(\$2) }' | sort -r -n -t ' ' -k 3,3"
+
+#formatovanie vystupu vo funkciach pos a last-price, nastavenie : zarovnanie dolava a ' ' pred nejdlhsi retazec
+SPACES="awk -F ' ' 'BEGIN { start = 1; max_len = 0 }
+                    { if (start) { start = 0; max_len = \$3 };
+                      printf \"%-10s: %*s\n\",\$1, max_len, \$2 }' "
+
+#vypocet hodnot aktuálně držených pozic, vystup: TICKER HODNOTA(zaokruhlena na 2 des. miesta)
+POS="awk -F ';' 'BEGIN { amount = 0; tick = 0; value = 0 }
+                       { if ( tick != \$2 && tick )
+                                  { printf \"%s %.2f\n\", tick, amount * value;
+                                    amount = 0 };
+                         if ( \$3 == \"sell\" ) { amount = amount - \$6 }
+                            else { amount = amount + \$6 }
+                         tick = \$2;
+                         value = \$4 }
+                 END { printf \"%s %.2f\n\",tick,amount * value }' "
+
+#vykreslenie grafu pre hist-ord a graph-pos, prijima: TICKER POCET_ZNAKOV
+GRAPH="awk -F ' ' '{ if (\$2 > 0) { sign = \"#\";
+                                    repeat = \$2 }
+                              else { sign = \"!\"
+                                     repeat = -\$2 }
+                     printf \"%-10s:\", \$1;
+                     if ( repeat != 0 ) {printf \" \"}
+                     for ( i = 0; i < repeat; i++) { printf\"%s\", sign}
+                     printf \"\n\" }'"
+
+if [ "$COMMAND" = "list-tick" ]; then
+      eval "$READ_FILTERED | awk -F ';' '{ print \$2 }' | sort -u"
+
+elif [ "$COMMAND" = "profit" ]; then
+      PROFIT="awk -F ';' 'BEGIN { profit = 0 }
+                   { value = \$4 * \$6;
+                     if ( \$3 == \"sell\" ) { profit = profit + value }
+                        else { profit = profit - value } }
+                   END { printf \"%.2f\n\", profit } '"
+
+      eval "$READ_FILTERED | $PROFIT"
+
+elif [ "$COMMAND" = "pos" ]; then
+      if [ "$READ_INPUT" != "cat" ]; then
+          empty_log "$READ_FILTERED"
+      fi
+
+      eval "$READ_FILTERED | sort | sort -s -t ';' -k 2,2 | $POS | $LENGTH | $SPACES | sort -r -n -t ':' -k 2,2"
+
+elif [ "$COMMAND" = "last-price" ]; then
+      if [ "$READ_INPUT" != "cat" ]; then
+        empty_log "$READ_FILTERED"
+      fi
+
+      LAST_PRICE="awk -F ';' 'BEGIN { tick = 0; value = 0 }
+                              { if ( tick != \$2 && tick ) { printf \"%s %.2f\n\", tick, value};
+                                tick = \$2;
+                                value = \$4 }
+                              END { printf \"%s %.2f\n\", tick, value }' "
+
+      eval "$READ_FILTERED | sort | sort -s -t ';' -k 2,2 | $LAST_PRICE | $LENGTH | $SPACES | sort"
+
+elif [ "$COMMAND" = "hist-ord" ]; then
+      if [ "$READ_INPUT" != "cat" ]; then
+        empty_log "$READ_FILTERED"
+      fi
+
+      HIST="awk -F ';' 'BEGIN { tick = 0; number = 0 }
+                        { if ( tick != \$2 && tick ) { print tick, number; number = 0};
+                          tick = \$2;
+                          number = number + 1 }
+                        END { print tick, number }' "
+
+      if [ "$WIDTH" != 0 ]; then
+          RATIO="sort -n -r -t ' ' -k 2,2 |
+                 awk -F ' ' 'BEGIN { start = 1; ratio = 0 }
+                             { if (start) { start = 0; ratio = $WIDTH / \$2 };
+                               printf \"%s %d\n\", \$1, \$2*ratio }' |
+                 sort"
+      else
+        RATIO="cat"
+      fi
+
+      eval "$READ_FILTERED | sort -t ';' -k 2,2 | $HIST | $RATIO | $GRAPH"
+
+elif [ "$COMMAND" = "graph-pos" ]; then
+      if [ "$READ_INPUT" != "cat" ]; then
+        empty_log "$READ_FILTERED"
+      fi
+
+      if [ "$WIDTH" != 0 ]; then
+        RATIO=" awk -F ' ' '{ if (\$2 < 0) { abs = -\$2 }
+                                  else { abs = \$2 }
+                              printf \"%s %.2f\n\", \$0, abs}' |
+                sort -n -r -t ' ' -k 3,3 |
+                awk -F ' ' 'BEGIN { start = 1; ratio = 0 }
+                            { if (start) { start = 0;
+                                           ratio = $WIDTH / \$3};
+                              printf \"%s %d\n\", \$1, \$2 * ratio }' |
+                sort"
+      else
+        #bez zadanej sirky je implicitne nastaveny 1 znak = 1000 + zaokruhlenie dole
+        WIDTH=1000;
+        RATIO="awk -F ' ' '{ printf \"%s %d\n\",\$1, \$2 / $WIDTH }' "
+      fi
+
+      eval "$READ_FILTERED | sort | sort -s -t ';' -k 2,2 | $POS | $RATIO | $GRAPH "
+
+else
+  eval "$READ_FILTERED"
+fi
